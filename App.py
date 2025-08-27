@@ -1,6 +1,8 @@
+# app.py
 import streamlit as st
 import sqlite3
 import requests
+from typing import Tuple, Optional
 
 # ==============================
 # CONFIG
@@ -12,67 +14,302 @@ ADMIN_EMAIL = "Admin@AIHUMANIZER.COM"
 ADMIN_PASS = "@Master123##₦"
 
 # ==============================
-# DATABASE
+# DATABASE HELPERS
 # ==============================
 def init_db():
+    """Create DB and default rows if they don't exist."""
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        # Users table
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        email TEXT UNIQUE,
-                        password TEXT,
-                        tokens INTEGER DEFAULT 2
-                    )""")
-        # Settings table
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (
-                        id INTEGER PRIMARY KEY,
-                        tokens_per_ad INTEGER,
-                        tokens_per_use INTEGER
-                    )""")
-        # Stats table
-        c.execute("""CREATE TABLE IF NOT EXISTS stats (
-                        id INTEGER PRIMARY KEY,
-                        ads_watched INTEGER,
-                        texts_humanized INTEGER
-                    )""")
-        # Defaults
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password TEXT,
+                tokens INTEGER DEFAULT 2
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY,
+                tokens_per_ad INTEGER,
+                tokens_per_use INTEGER
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stats (
+                id INTEGER PRIMARY KEY,
+                ads_watched INTEGER,
+                texts_humanized INTEGER
+            )
+            """
+        )
+        # Insert default settings/stats if missing
         c.execute("INSERT OR IGNORE INTO settings (id, tokens_per_ad, tokens_per_use) VALUES (1, 1, 1)")
         c.execute("INSERT OR IGNORE INTO stats (id, ads_watched, texts_humanized) VALUES (1, 0, 0)")
         conn.commit()
 
-def get_settings():
+def get_settings() -> Tuple[int, int]:
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("SELECT tokens_per_ad, tokens_per_use FROM settings WHERE id=1")
-        return c.fetchone()
+        row = c.fetchone()
+        if row:
+            return int(row[0]), int(row[1])
+        return 1, 1
 
-def update_settings(tokens_per_ad, tokens_per_use):
+def update_settings(tokens_per_ad: int, tokens_per_use: int) -> None:
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("UPDATE settings SET tokens_per_ad=?, tokens_per_use=? WHERE id=1",
-                  (tokens_per_ad, tokens_per_use))
+        c.execute("UPDATE settings SET tokens_per_ad=?, tokens_per_use=? WHERE id=1", (tokens_per_ad, tokens_per_use))
         conn.commit()
 
-def get_stats():
+def get_stats() -> Tuple[int, int]:
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("SELECT ads_watched, texts_humanized FROM stats WHERE id=1")
-        return c.fetchone()
+        row = c.fetchone()
+        if row:
+            return int(row[0]), int(row[1])
+        return 0, 0
 
-def increment_stat(field):
+def increment_stat(field: str) -> None:
+    assert field in ("ads_watched", "texts_humanized")
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute(f"UPDATE stats SET {field} = {field} + 1 WHERE id=1")
         conn.commit()
 
-def get_user(email):
+def get_user(email: str) -> Optional[tuple]:
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE email=?", (email,))
+        c.execute("SELECT id, email, password, tokens FROM users WHERE email=?", (email,))
         return c.fetchone()
 
-def add_user(email, password):
+def add_user(email: str, password: str, tokens: int = 2) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO users (email, password, tokens) VALUES (?, ?, ?)", (email, password, tokens))
+        conn.commit()
+
+def update_tokens(email: str, tokens: int) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET tokens=? WHERE email=?", (tokens, email))
+        conn.commit()
+
+def count_users() -> Tuple[int, int]:
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), SUM(tokens) FROM users")
+        row = c.fetchone()
+        if row:
+            user_count = int(row[0])
+            total_tokens = int(row[1]) if row[1] is not None else 0
+            return user_count, total_tokens
+        return 0, 0
+
+# ==============================
+# AI CALL
+# ==============================
+def humanize_text(input_text: str) -> str:
+    """Call DeepSeek (or return an error message)."""
+    if not input_text or not input_text.strip():
+        return "⚠️ No text provided."
+
+    try:
+        resp = requests.post(
+            "https://api.deepseek.com/v1/completions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek-chat",
+                "prompt": "Humanize this text: " + input_text,
+                "max_tokens": 500
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # safe navigation
+        choices = data.get("choices") or []
+        if len(choices) > 0:
+            return choices[0].get("text") or choices[0].get("message", {}).get("content", "⚠️ No text returned.")
+        # fallback for other shapes:
+        return data.get("text") or "⚠️ Unexpected response shape from API."
+    except requests.RequestException as e:
+        return f"⚠️ Network/API error: {str(e)}"
+    except Exception as e:
+        return f"⚠️ Unexpected error: {str(e)}"
+
+# ==============================
+# STREAMLIT UI
+# ==============================
+def user_app(email: str):
+    st.header("📝 AI Text Humanizer")
+    user = get_user(email)
+    if not user:
+        st.error("User not found. Please log out and log in again.")
+        return
+
+    user_id, user_email, _, user_tokens = user
+    user_tokens = int(user_tokens)
+
+    tokens_per_ad, tokens_per_use = get_settings()
+
+    col_top_left, col_top_right = st.columns([3, 1])
+    with col_top_left:
+        st.write(f"**Logged in as:** {user_email}")
+    with col_top_right:
+        st.metric("Tokens", user_tokens)
+
+    st.write("---")
+    text_input = st.text_area("Paste your text here:", height=220)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✨ Humanize"):
+            if user_tokens < tokens_per_use:
+                st.warning("Not enough tokens. Please watch an ad to earn more!")
+            elif not text_input.strip():
+                st.warning("Please enter some text first.")
+            else:
+                # Deduct tokens first
+                new_tokens = user_tokens - tokens_per_use
+                update_tokens(email, new_tokens)
+                increment_stat("texts_humanized")
+                # Get result and display
+                with st.spinner("Humanizing..."):
+                    result = humanize_text(text_input)
+                st.subheader("✅ Humanized Text")
+                st.write(result)
+                # refresh the page so token metric updates
+                st.experimental_rerun()
+
+    with col2:
+        if st.button("🎬 Watch Ad (Simulated)"):
+            # Add tokens_per_ad to user's tokens
+            new_tokens = user_tokens + tokens_per_ad
+            update_tokens(email, new_tokens)
+            increment_stat("ads_watched")
+            st.success(f"Ad watched! You earned {tokens_per_ad} token(s).")
+            st.experimental_rerun()
+
+    st.write("---")
+    st.markdown(
+        "⚠️ Ads are simulated on web. To integrate AdMob/Start.io you will need platform SDKs (mobile)."
+    )
+
+def admin_app():
+    st.header("⚙️ Admin Panel")
+    tokens_per_ad, tokens_per_use = get_settings()
+    ads_watched, texts_humanized = get_stats()
+    user_count, total_tokens = count_users()
+
+    st.subheader("🔧 Settings")
+    with st.form("settings_form", clear_on_submit=False):
+        new_tokens_per_ad = st.number_input("Tokens per Ad", min_value=1, value=int(tokens_per_ad))
+        new_tokens_per_use = st.number_input("Tokens per Use (tokens consumed per humanize)", min_value=1, value=int(tokens_per_use))
+        submitted = st.form_submit_button("Update Settings")
+        if submitted:
+            update_settings(int(new_tokens_per_ad), int(new_tokens_per_use))
+            st.success("Settings updated.")
+            st.experimental_rerun()
+
+    st.subheader("📊 Stats")
+    st.write(f"👥 Total Users: **{user_count}**")
+    st.write(f"💰 Total Tokens across users: **{total_tokens}**")
+    st.write(f"🎬 Ads Watched: **{ads_watched}**")
+    st.write(f"📝 Texts Humanized: **{texts_humanized}**")
+
+    st.subheader("🔎 Users")
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, email, tokens FROM users ORDER BY id DESC LIMIT 200")
+        rows = c.fetchall()
+        if rows:
+            for r in rows:
+                st.write(f"- {r[1]} — {r[2]} tokens")
+        else:
+            st.write("No users yet.")
+
+# ==============================
+# MAIN
+# ==============================
+def main():
+    st.set_page_config(page_title="AI Text Humanizer", page_icon="✨", layout="centered")
+    init_db()
+
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+        st.session_state.email = None
+        st.session_state.admin = False
+
+    # Top-level layout: login or app
+    if not st.session_state.logged_in:
+        st.title("🔑 Login / Sign Up")
+
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login / Sign Up")
+
+            if submitted:
+                if not email or not password:
+                    st.error("Please provide both email and password.")
+                else:
+                    # Admin login check
+                    if email == ADMIN_EMAIL and password == ADMIN_PASS:
+                        st.session_state.logged_in = True
+                        st.session_state.admin = True
+                        st.session_state.email = ADMIN_EMAIL
+                        st.success("Admin logged in.")
+                        st.experimental_rerun()
+                    else:
+                        user = get_user(email)
+                        if user:
+                            # existing user: check password
+                            _, _, stored_password, _ = user
+                            if stored_password == password:
+                                st.session_state.logged_in = True
+                                st.session_state.email = email
+                                st.session_state.admin = False
+                                st.success("Logged in.")
+                                st.experimental_rerun()
+                            else:
+                                st.error("Wrong password.")
+                        else:
+                            # register user
+                            try:
+                                add_user(email, password, tokens=2)
+                                st.session_state.logged_in = True
+                                st.session_state.email = email
+                                st.session_state.admin = False
+                                st.success("Account created and logged in.")
+                                st.experimental_rerun()
+                            except sqlite3.IntegrityError:
+                                st.error("This email is already registered.")
+    else:
+        # Logged in view
+        if st.session_state.admin:
+            admin_app()
+        else:
+            user_app(st.session_state.email)
+
+        if st.button("🚪 Logout"):
+            st.session_state.logged_in = False
+            st.session_state.email = None
+            st.session_state.admin = False
+            st.experimental_rerun()
+
+if __name__ == "__main__":
+    main()def add_user(email, password):
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("INSERT INTO users (email, password, tokens) VALUES (?, ?, ?)", (email, password, 2))
